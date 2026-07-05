@@ -9,35 +9,99 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const nodemailer = require('nodemailer');
+const crypto = require('crypto');
+const Razorpay = require('razorpay');
+const { MongoClient } = require('mongodb');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 app.use(cors({ origin: process.env.ALLOWED_ORIGIN || '*' }));
 
 const {
-  GMAIL_USER,
-  GMAIL_APP_PASSWORD,
   OWNER_EMAIL,
   STORE_NAME = 'Koundinya Constructions',
   PORT = 3000,
+  RAZORPAY_KEY_ID,
+  RAZORPAY_KEY_SECRET,
+  MONGODB_URI,
+  ADMIN_PASSCODE = 'koundinya',
+  BREVO_API_KEY,
+  SENDER_EMAIL,   // a verified sender address in your Brevo account
 } = process.env;
 
-// ── Gmail transporter ───────────────────────────────────────────────────────
-// Gmail requires an "App Password" (with 2-Step Verification on), not your
-// normal password. See .env.example for how to create one.
-const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: { user: GMAIL_USER, pass: GMAIL_APP_PASSWORD },
-});
+// ── MongoDB ─────────────────────────────────────────────────────────────────
+// Stores all orders in one place so the admin sees every order from every
+// device. If MONGODB_URI isn't set, the server still runs (email-only mode)
+// but order storage/listing endpoints return an error.
+let ordersCol = null;
+if (MONGODB_URI) {
+  const mongo = new MongoClient(MONGODB_URI);
+  mongo.connect()
+    .then(() => {
+      ordersCol = mongo.db('koundinya').collection('orders');
+      console.log('✓ MongoDB connected — orders will be saved');
+    })
+    .catch(err => console.error('✗ MongoDB connection failed:', err.message));
+} else {
+  console.log('• MongoDB not configured (set MONGODB_URI to save orders server-side)');
+}
 
-// Verify credentials on boot so problems show up immediately, not on first order.
-transporter.verify()
-  .then(() => console.log('✓ Gmail SMTP ready — emails will send from', GMAIL_USER))
-  .catch(err => {
-    console.error('✗ Gmail SMTP not ready. Check GMAIL_USER / GMAIL_APP_PASSWORD in .env');
-    console.error('  ', err.message);
+// Fulfilment stages (kept in sync with the website)
+const STAGES = ['Placed', 'Confirmed', 'Dispatched', 'Out for delivery', 'Delivered'];
+
+// Simple owner check for admin endpoints (passcode sent in a header)
+function isOwner(req) {
+  return (req.headers['x-admin-passcode'] || '') === ADMIN_PASSCODE;
+}
+
+// ── Razorpay client ─────────────────────────────────────────────────────────
+// Only created if keys are present, so the email features still work without
+// payment configured. Keys come from the Razorpay dashboard (test or live).
+let razorpay = null;
+if (RAZORPAY_KEY_ID && RAZORPAY_KEY_SECRET) {
+  razorpay = new Razorpay({ key_id: RAZORPAY_KEY_ID, key_secret: RAZORPAY_KEY_SECRET });
+  console.log('✓ Razorpay ready —', RAZORPAY_KEY_ID.startsWith('rzp_live') ? 'LIVE mode' : 'TEST mode');
+} else {
+  console.log('• Razorpay not configured (set RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET to enable online payments)');
+}
+
+// ── Email via Brevo API (HTTPS) ─────────────────────────────────────────────
+// We send through Brevo's HTTP API instead of SMTP, because many free hosts
+// (e.g. Render free tier) block outbound SMTP ports. HTTPS is never blocked.
+// Get a free API key at brevo.com → Settings → SMTP & API → API Keys, and
+// verify your sender address under Senders.
+const EMAIL_READY = Boolean(BREVO_API_KEY && SENDER_EMAIL);
+if (EMAIL_READY) {
+  console.log('✓ Brevo email ready — sending from', SENDER_EMAIL);
+} else {
+  console.log('✗ Email not configured. Set BREVO_API_KEY and SENDER_EMAIL to enable emails.');
+}
+
+// Sends one email through Brevo. Returns true on success.
+async function sendEmail({ to, subject, html, text, replyTo, senderName }) {
+  if (!EMAIL_READY) throw new Error('Email not configured');
+  const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: {
+      'api-key': BREVO_API_KEY,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+    },
+    body: JSON.stringify({
+      sender: { name: senderName || STORE_NAME, email: SENDER_EMAIL },
+      to: [{ email: to }],
+      subject,
+      htmlContent: html,
+      textContent: text,
+      ...(replyTo ? { replyTo: { email: replyTo } } : {}),
+    }),
   });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => '');
+    throw new Error(`Brevo ${res.status}: ${detail.slice(0, 200)}`);
+  }
+  return true;
+}
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 const rupee = n => '₹' + Number(n || 0).toLocaleString('en-IN');
@@ -141,6 +205,139 @@ function buildEmailText(order, trackUrl) {
 // ── routes ──────────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
+// ── orders: create (called at checkout) ─────────────────────────────────────
+// Generates the order number server-side and saves the order. Returns the
+// saved order (with its id) so the website can show + track it.
+app.post('/api/orders', async (req, res) => {
+  if (!ordersCol) return res.status(503).json({ ok: false, error: 'Order storage not configured' });
+  const { customer, items, delivery = 250 } = req.body || {};
+  if (!customer || !customer.name || !customer.phone) {
+    return res.status(400).json({ ok: false, error: 'Missing customer details' });
+  }
+  if (!Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ ok: false, error: 'Order has no items' });
+  }
+  try {
+    const subtotal = items.reduce((s, i) => s + Number(i.price) * Number(i.qty), 0);
+    const count = await ordersCol.countDocuments();
+    const order = {
+      id: 'KC-' + (1001 + count),
+      placedAt: new Date().toISOString(),
+      customer,
+      items,
+      subtotal,
+      delivery,
+      total: subtotal + delivery,
+      stage: 'Placed',
+      history: [{ stage: 'Placed', at: new Date().toISOString() }],
+    };
+    await ordersCol.insertOne(order);
+    res.json({ ok: true, order });
+  } catch (err) {
+    console.error('✗ create order failed:', err.message);
+    res.status(500).json({ ok: false, error: 'Could not save order' });
+  }
+});
+
+// ── orders: track one (customer: order id + phone must match) ────────────────
+app.get('/api/orders/track', async (req, res) => {
+  if (!ordersCol) return res.status(503).json({ ok: false, error: 'Order storage not configured' });
+  const id = String(req.query.id || '').trim().toUpperCase();
+  const phone = String(req.query.phone || '').replace(/\D/g, '');
+  if (!id || !phone) return res.status(400).json({ ok: false, error: 'Order number and phone required' });
+  try {
+    const order = await ordersCol.findOne({ id });
+    const onFile = order ? String(order.customer.phone || '').replace(/\D/g, '') : '';
+    // Same neutral message whether missing or phone mismatch (privacy).
+    if (!order || onFile !== phone) {
+      return res.status(404).json({ ok: false, error: 'No matching order' });
+    }
+    delete order._id;
+    res.json({ ok: true, order });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: 'Lookup failed' });
+  }
+});
+
+// ── orders: list all (owner only) ───────────────────────────────────────────
+app.get('/api/orders', async (req, res) => {
+  if (!ordersCol) return res.status(503).json({ ok: false, error: 'Order storage not configured' });
+  if (!isOwner(req)) return res.status(401).json({ ok: false, error: 'Unauthorized' });
+  try {
+    const orders = await ordersCol.find({}).sort({ placedAt: -1 }).limit(500).toArray();
+    orders.forEach(o => delete o._id);
+    res.json({ ok: true, orders });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: 'Could not list orders' });
+  }
+});
+
+// ── orders: update status (owner only) ──────────────────────────────────────
+app.patch('/api/orders/:id', async (req, res) => {
+  if (!ordersCol) return res.status(503).json({ ok: false, error: 'Order storage not configured' });
+  if (!isOwner(req)) return res.status(401).json({ ok: false, error: 'Unauthorized' });
+  const id = String(req.params.id).toUpperCase();
+  const stage = String(req.body.stage || '');
+  if (!STAGES.includes(stage)) return res.status(400).json({ ok: false, error: 'Invalid stage' });
+  try {
+    const r = await ordersCol.findOneAndUpdate(
+      { id },
+      { $set: { stage }, $push: { history: { stage, at: new Date().toISOString() } } },
+      { returnDocument: 'after' }
+    );
+    const updated = r.value || r; // driver version differences
+    if (!updated) return res.status(404).json({ ok: false, error: 'Order not found' });
+    if (updated._id) delete updated._id;
+    res.json({ ok: true, order: updated });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: 'Could not update order' });
+  }
+});
+
+// ── payment: create a Razorpay order ────────────────────────────────────────
+// The browser sends the amount; we create a Razorpay order server-side and
+// return its id plus the public key id. (In production, recompute the amount
+// from the cart server-side rather than trusting the client.)
+app.post('/api/payment/create-order', async (req, res) => {
+  if (!razorpay) return res.status(503).json({ ok: false, error: 'Payments not configured' });
+  const amount = Math.round(Number(req.body.amount));
+  if (!amount || amount < 1) return res.status(400).json({ ok: false, error: 'Invalid amount' });
+  try {
+    const order = await razorpay.orders.create({
+      amount: amount * 100,          // Razorpay works in paise
+      currency: 'INR',
+      receipt: 'rcpt_' + Date.now(),
+      notes: { customer: req.body.customer?.name || '', phone: req.body.customer?.phone || '' },
+    });
+    res.json({ ok: true, order, keyId: RAZORPAY_KEY_ID });
+  } catch (err) {
+    console.error('✗ create-order failed:', err.message);
+    res.status(502).json({ ok: false, error: 'Could not start payment' });
+  }
+});
+
+// ── payment: verify the signature after payment ─────────────────────────────
+// Razorpay signs (order_id|payment_id) with your secret. We recompute it and
+// compare — this proves the payment is genuine and wasn't faked by the browser.
+app.post('/api/payment/verify', (req, res) => {
+  if (!razorpay) return res.status(503).json({ ok: false, error: 'Payments not configured' });
+  const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+  if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+    return res.status(400).json({ ok: false, error: 'Missing payment fields' });
+  }
+  const expected = crypto
+    .createHmac('sha256', RAZORPAY_KEY_SECRET)
+    .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+    .digest('hex');
+  if (expected === razorpay_signature) {
+    console.log('✓ Payment verified:', razorpay_payment_id);
+    res.json({ ok: true });
+  } else {
+    console.warn('✗ Payment signature mismatch for', razorpay_payment_id);
+    res.status(400).json({ ok: false, error: 'Signature verification failed' });
+  }
+});
+
 app.post('/api/order-email', async (req, res) => {
   const order = req.body.order;
   const trackUrl = req.body.trackUrl || '';
@@ -154,24 +351,22 @@ app.post('/api/order-email', async (req, res) => {
 
   try {
     // 1) confirmation to the customer
-    await transporter.sendMail({
-      from: `"${STORE_NAME}" <${GMAIL_USER}>`,
+    await sendEmail({
       to: order.customer.email,
       subject,
-      text,        // plain-text part — helps avoid spam folders
       html,
-      replyTo: OWNER_EMAIL || GMAIL_USER,
-      headers: { 'X-Entity-Ref-ID': order.id },
+      text,
+      replyTo: OWNER_EMAIL || SENDER_EMAIL,
     });
 
     // 2) a copy to the owner (best-effort; don't fail the request if this one errors)
     if (OWNER_EMAIL) {
-      transporter.sendMail({
-        from: `"${STORE_NAME} Orders" <${GMAIL_USER}>`,
+      sendEmail({
         to: OWNER_EMAIL,
         subject: `New order ${order.id} — ${order.customer.name}`,
-        text,
         html,
+        text,
+        senderName: `${STORE_NAME} Orders`,
       }).catch(e => console.error('Owner copy failed:', e.message));
     }
 
