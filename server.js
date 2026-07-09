@@ -287,12 +287,36 @@ app.put('/api/categories', async (req, res) => {
   }
 });
 
+// ── settings: store-wide settings like the delivery fee ─────────────────────
+const DEFAULT_DELIVERY = 250;
+app.get('/api/settings', async (_req, res) => {
+  if (!metaCol) return res.status(503).json({ ok: false, error: 'Storage not configured' });
+  try {
+    const doc = await metaCol.findOne({ _id: 'settings' });
+    const deliveryFee = (doc && typeof doc.deliveryFee === 'number') ? doc.deliveryFee : DEFAULT_DELIVERY;
+    res.json({ ok: true, settings: { deliveryFee } });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: 'Could not load settings' });
+  }
+});
+app.put('/api/settings', async (req, res) => {
+  if (!metaCol) return res.status(503).json({ ok: false, error: 'Storage not configured' });
+  if (!isOwner(req)) return res.status(401).json({ ok: false, error: 'Unauthorized' });
+  const deliveryFee = Math.max(0, parseInt(req.body.deliveryFee, 10) || 0);
+  try {
+    await metaCol.updateOne({ _id: 'settings' }, { $set: { deliveryFee } }, { upsert: true });
+    res.json({ ok: true, settings: { deliveryFee } });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: 'Could not save settings' });
+  }
+});
+
 // ── orders: create (called at checkout) ─────────────────────────────────────
 // Generates the order number server-side and saves the order. Returns the
 // saved order (with its id) so the website can show + track it.
 app.post('/api/orders', async (req, res) => {
   if (!ordersCol) return res.status(503).json({ ok: false, error: 'Order storage not configured' });
-  const { customer, items, delivery = 250 } = req.body || {};
+  const { customer, items } = req.body || {};
   if (!customer || !customer.name || !customer.phone) {
     return res.status(400).json({ ok: false, error: 'Missing customer details' });
   }
@@ -300,6 +324,12 @@ app.post('/api/orders', async (req, res) => {
     return res.status(400).json({ ok: false, error: 'Order has no items' });
   }
   try {
+    // Use the delivery fee stored in settings (not the client's value).
+    let delivery = DEFAULT_DELIVERY;
+    if (metaCol) {
+      const s = await metaCol.findOne({ _id: 'settings' });
+      if (s && typeof s.deliveryFee === 'number') delivery = s.deliveryFee;
+    }
     const subtotal = items.reduce((s, i) => s + Number(i.price) * Number(i.qty), 0);
     const count = await ordersCol.countDocuments();
     const order = {
